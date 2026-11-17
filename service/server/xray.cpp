@@ -7,6 +7,10 @@
 #include <QDebug>
 #include <QNetworkInterface>
 #include <QCoreApplication>
+#include <QHostAddress>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <amnezia_xray.h>
 #include <qdebug.h>
 
@@ -29,6 +33,35 @@
 #ifdef Q_OS_LINUX
     #include <sys/socket.h>
     #include "xray_defs.h"
+#endif
+
+#ifdef Q_OS_WIN
+// Returns the outbound server address (IPv4 literal or hostname) from an xray config,
+// or an empty string if it cannot be determined.
+static QString xrayServerAddressFromConfig(const QString &cfg)
+{
+    const QJsonObject root = QJsonDocument::fromJson(cfg.toUtf8()).object();
+    const QJsonArray outbounds = root.value("outbounds").toArray();
+    for (const QJsonValue &ov : outbounds) {
+        const QJsonObject settings = ov.toObject().value("settings").toObject();
+        // vless / vmess
+        const QJsonArray vnext = settings.value("vnext").toArray();
+        if (!vnext.isEmpty()) {
+            const QString a = vnext.first().toObject().value("address").toString();
+            if (!a.isEmpty()) return a;
+        }
+        // shadowsocks / trojan
+        const QJsonArray servers = settings.value("servers").toArray();
+        if (!servers.isEmpty()) {
+            const QString a = servers.first().toObject().value("address").toString();
+            if (!a.isEmpty()) return a;
+        }
+        // vless/vmess "flat" form
+        const QString flat = settings.value("address").toString();
+        if (!flat.isEmpty()) return flat;
+    }
+    return {};
+}
 #endif
 
 qint64 Xray::start(const QString &cfg)
@@ -88,6 +121,29 @@ bool Xray::startXray(const QString &cfg)
     m_defaultIfaceName = defaultIface.name().toUtf8();
 #else
     m_defaultIfaceIdx = defaultIface.index();
+#endif
+#ifdef Q_OS_WIN
+    // getGatewayAndIface() returns the *last* adapter that has a gateway, which is not
+    // necessarily the one that routes to the xray server (e.g. server reachable only via
+    // Tailscale, or a disabled/unused Wi-Fi adapter listed last). Ask the routing table instead.
+    {
+        const QString serverHost = xrayServerAddressFromConfig(cfg);
+        QHostAddress serverAddr(serverHost);
+        if (serverAddr.isNull() && !serverHost.isEmpty()) {
+            serverAddr = QHostAddress(NetworkUtilities::getIPAddress(serverHost));
+        }
+        if (!serverAddr.isNull() && serverAddr.protocol() == QAbstractSocket::IPv4Protocol) {
+            const int routedIdx = NetworkUtilities::AdapterIndexTo(serverAddr);
+            if (routedIdx > 0) {
+                qDebug() << "[xray] GetBestRoute to" << serverAddr.toString() << "-> ifIndex" << routedIdx
+                         << "(was" << m_defaultIfaceIdx << ")";
+                m_defaultIfaceIdx = routedIdx;
+            } else {
+                qWarning() << "[xray] GetBestRoute failed for" << serverAddr.toString()
+                           << ", keeping ifIndex" << m_defaultIfaceIdx;
+            }
+        }
+    }
 #endif
     if (defaultIface.index() > 0) {
         qDebug() << "[xray] using uplink interface:" << defaultIface.name() << "(" << defaultIface.index() << ")";
